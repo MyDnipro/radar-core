@@ -437,6 +437,155 @@ def geocode_local(text):
 
     return None, None, None
 
+
+# ======================================================================
+# ПОВНИЙ СПИСОК ВУЛИЦЬ ДНІПРА (з OpenStreetMap, файл streets_dnipro.json)
+# Працює ЛИШЕ як запасний варіант: після ручних правил, бази знань і Nominatim,
+# але перед Gemini. Усе, що радар вже вмів знаходити, лишається як було.
+#   "log" — тільки пише в журнал, що знайшов би (точки НЕ змінюються)
+#   "on"  — реально ставить точку за списком
+#   "off" — вимкнено
+# ======================================================================
+STREETS_LIST_MODE = "log"
+STREETS_LIST_URL = "https://radar-core-test.web.app/streets_dnipro.json"
+STREETS_REFRESH_SEC = 6 * 3600
+MIN_CORE_LEN = 5          # мінімальна довжина назви для пошуку
+MIN_SURNAME_LEN = 6       # мінімальна довжина прізвища, якщо в пості тільки воно
+
+STREET_TYPE_WORDS = {
+    "вулиця", "вул", "улица", "ул", "проспект", "просп", "пр", "провулок", "пров", "переулок", "пер",
+    "площа", "пл", "площадь", "набережна", "наб", "набережная", "шосе", "шоссе", "бульвар", "бул",
+    "узвіз", "спуск", "тупик", "тупік", "проїзд", "проезд", "алея", "аллея", "майдан", "дорога",
+    "міст", "мост", "в'їзд", "виїзд", "лінія", "линия", "імені", "имени", "им", "ім"
+}
+# слова, які в постах зустрічаються як звичайні слова, а не як вулиці
+STREET_STOP_WORDS = {
+    "чисто", "пусто", "вільно", "свободно", "центр", "центральна", "центральная", "головна", "главная",
+    "нова", "новая", "стара", "старая", "лісова", "лесная", "садова", "садовая", "річкова", "речная",
+    "дніпро", "днепр", "міська", "городская", "об'їзна", "объездная", "перша", "первая", "друга", "вторая"
+}
+
+STREETS_INDEX = {"full": {}, "surname": {}, "loaded_at": 0}
+
+
+def street_norm(text):
+    t = str(text or "").lower()
+    for a, b in (("ё", "е"), ("є", "е"), ("э", "е"), ("і", "и"), ("ї", "и"), ("ы", "и"), ("ґ", "г"), ("ъ", ""), ("ь", "")):
+        t = t.replace(a, b)
+    t = t.replace("ськ", "ск")
+    t = re.sub(r"[’'`ʼ]", "", t)
+    t = re.sub(r"[^a-zа-я0-9\s-]", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+NORM_TYPE_WORDS = {street_norm(w) for w in STREET_TYPE_WORDS}
+NORM_STOP_WORDS = {street_norm(w) for w in STREET_STOP_WORDS}
+STEM_ENDINGS = ("ий", "ый", "ой", "ая", "яя", "ое", "ее", "ою", "а", "я", "у", "ю", "о", "е", "и")
+
+
+def street_core_tokens(name):
+    return [w for w in street_norm(name).split(" ") if w and w not in NORM_TYPE_WORDS]
+
+
+def street_stem(tok):
+    for end in STEM_ENDINGS:
+        if tok.endswith(end) and len(tok) - len(end) >= 5:
+            return tok[:-len(end)]
+    return tok
+
+
+def load_streets_index(force=False):
+    """Завантажує streets_dnipro.json з сайту і будує індекс. Помилка = просто без списку."""
+    if STREETS_LIST_MODE == "off":
+        return
+    now = time.time()
+    if not force and STREETS_INDEX["loaded_at"] and (now - STREETS_INDEX["loaded_at"]) < STREETS_REFRESH_SEC:
+        return
+    try:
+        r = requests.get(STREETS_LIST_URL + f"?t={int(now)}", timeout=15, headers={"User-Agent": "DniproRadar/5.7"})
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code}")
+        data = r.json()
+        streets = data.get("streets") or []
+        build_streets_index(streets)
+        STREETS_INDEX["loaded_at"] = now
+        log(f"🗂️ [СПИСОК ВУЛИЦЬ]: завантажено {len(streets)} записів, для пошуку придатно: "
+            f"{len(STREETS_INDEX['full'])} назв + {len(STREETS_INDEX['surname'])} прізвищ (режим: {STREETS_LIST_MODE})")
+    except Exception as e:
+        STREETS_INDEX["loaded_at"] = now - STREETS_REFRESH_SEC + 600  # повторимо через 10 хв
+        log(f"⚠️ [СПИСОК ВУЛИЦЬ]: не вдалося завантажити ({e}) — працюємо без нього")
+
+
+def build_streets_index(streets):
+    """Індекс за основами слів. У нього потрапляє тільки те, що вказує РІВНО на одну вулицю."""
+    records = []
+    cand = {}        # "основа основа" -> множина id записів
+    sur_cand = {}    # основа прізвища -> множина id записів
+    stem_usage = {}  # будь-яка основа слова -> множина id записів, де вона трапляється
+    for st in streets:
+        try:
+            rec = {"n": st["n"], "la": float(st["la"]), "ln": float(st["ln"])}
+        except Exception:
+            continue
+        rid = len(records)
+        records.append(rec)
+        names = [st["n"]] + list(st.get("o") or []) + list(st.get("a") or [])
+        for nm in names:
+            toks = street_core_tokens(nm)
+            if not toks:
+                continue
+            stems = [street_stem(t) for t in toks]
+            for sm in stems:
+                stem_usage.setdefault(sm, set()).add(rid)
+            if len(" ".join(toks)) < MIN_CORE_LEN or any(t in NORM_STOP_WORDS for t in toks):
+                continue
+            cand.setdefault(" ".join(stems), set()).add(rid)
+            if len(stems) >= 2 and len(toks[-1]) >= MIN_SURNAME_LEN:
+                sur_cand.setdefault(stems[-1], set()).add(rid)
+
+    full, surname = {}, {}
+    for key, ids in cand.items():
+        if len(ids) != 1:
+            continue
+        # одне слово (напр. "Шевченка") не можна брати, якщо воно є ще в чиїйсь назві
+        if " " not in key and len(stem_usage.get(key, ids)) != 1:
+            continue
+        full[key] = records[next(iter(ids))]
+    for sm, ids in sur_cand.items():
+        if len(ids) == 1 and len(stem_usage.get(sm, ids)) == 1:
+            surname[sm] = records[next(iter(ids))]
+    STREETS_INDEX["full"] = full
+    STREETS_INDEX["surname"] = surname
+
+
+def geocode_streets_list(text):
+    """Повертає (адреса, lat, lng) або (None, None, None). Тільки однозначні збіги."""
+    if STREETS_LIST_MODE == "off":
+        return None, None, None
+    load_streets_index()
+    full, surname = STREETS_INDEX["full"], STREETS_INDEX["surname"]
+    if not full and not surname:
+        return None, None, None
+
+    t = " " + street_norm(text) + " "
+    best = None  # (довжина збігу, запис)
+
+    for key, rec in full.items():
+        pat = r"(?<![a-zа-я0-9])" + r"\s+".join(re.escape(x) + r"[a-zа-я]{0,3}" for x in key.split(" ")) + r"(?![a-zа-я0-9])"
+        if re.search(pat, t) and (not best or len(key) > best[0]):
+            best = (len(key), rec)
+
+    for sm, rec in surname.items():
+        pat = r"(?<![a-zа-я0-9])" + re.escape(sm) + r"[a-zа-я]{0,3}(?![a-zа-я0-9])"
+        if re.search(pat, t) and (not best or len(sm) > best[0]):
+            best = (len(sm), rec)
+
+    if not best:
+        return None, None, None
+    rec = best[1]
+    return rec["n"], round(rec["la"], 5), round(rec["ln"], 5)
+
+
 def geocode_osm_fallback(text):
     clean = re.sub(r'(?:чисто|пусто|вільно|спокійно|спокойно|норм|нормально|бп|блокпост|патруль|роздають|хмари|сині|дощ|сонце|сонечко|без\s*ям|без\s*бп|нет\s*бп|🌞|☀️)\b', '', text, flags=re.I).strip()
     words = [w for w in re.split(r'[,+\n/]', clean) if len(w.strip()) >= 4]
@@ -891,6 +1040,25 @@ def sync_cycle():
                     "needs_training": False
                 }
                 log(f"🗺️ [OSM КАРТА]: '{msg[:45]}' ➔ {osm_addr}")
+
+        if not parsed_result and STREETS_LIST_MODE != "off":
+            try:
+                list_addr, list_lat, list_lng = geocode_streets_list(msg)
+            except Exception as e:
+                list_addr, list_lat, list_lng = None, None, None
+                log(f"⚠️ [СПИСОК ВУЛИЦЬ]: помилка пошуку ({e})")
+            if list_addr:
+                if STREETS_LIST_MODE == "on":
+                    parsed_result = {
+                        "address": list_addr,
+                        "lat": list_lat,
+                        "lng": list_lng,
+                        "status": "чисто" if is_clean else "опасно",
+                        "needs_training": False
+                    }
+                    log(f"🗂️ [СПИСОК ВУЛИЦЬ]: '{msg[:45]}' ➔ {list_addr}")
+                else:
+                    log(f"🧪 [СПИСОК ВУЛИЦЬ / ТЕСТ]: '{msg[:60]}' ➔ {list_addr} ({list_lat}, {list_lng}) — точку НЕ змінено")
 
         if parsed_result:
             save_point_to_firebase(sub_post_id, msg, parsed_result, is_clean, post_time_ms)
