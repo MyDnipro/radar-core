@@ -756,7 +756,7 @@ def render_panel(s) -> str:
     if s.get("state") == "CONFIRM" and not s.get("ask_cancel"):
         lines += ["", tr(L, "nsfw_short")]   # правило — до оплати
     bp = bipi_for(s)
-    if bp and s.get("state") != "GENERATING" and s.get("_bp_show") == s.get("state"):
+    if bp and s.get("state") != "GENERATING" and s.get("_bp_show") == s.get("state"):   # під час роботи фраза вже в статусі
         lines += ["", bipi_line(bp[1])]   # Біпі «заговорив» через 3–4 с — вузький рядок над кнопками
     return "\n".join(lines)
 
@@ -782,35 +782,19 @@ def ui(s):
             want = "pic_model"   # останній крок: вибір моделі з ціною
         if want == "pic_gen" and s.get("gen_mode", "hook") == "hook":
             want = "pic_prompt"   # безкоштовний хук: робимо промпт, а не відео
-        if want == "pic_format" and want != s.get("pic") and billboard(s["lang"]):   # «Що робимо?» — білборд
-            bb = billboard(s["lang"])
-            fid = _bb_ids.get(bb)
-            fh = None if fid else open(bb, "rb")
-            try:
-                media = tg_types.InputMediaAnimation(fid or fh, caption=text[:1020] or None, parse_mode=mode,
-                                                     width=1080, height=880)
-                r = bot.edit_message_media(media, chat_id=s["chat_id"], message_id=s["msg_id"], reply_markup=kb)
-            finally:
-                if fh:
-                    fh.close()
-            try:
-                _bb_ids[bb] = r.animation.file_id
-            except Exception:
-                pass
-            s["pic"], s["pic_key"] = want, (want, None)
-            return
         bp = bipi_for(s) if s.get("state") == "GENERATING" else None   # картка — лише під час роботи
+        if bp and is_video(pic_path(want, s["lang"]) if want else None):
+            bp = None   # є відео «Генерую» — фраза рядком у підписі, картинка не міняється
         pkey = (want, bp)
         if want and (want != s.get("pic") or pkey != s.get("pic_key")) and pic_path(want, s["lang"]):
             path = pic_path(want, s["lang"])   # новий крок (або новий Біпі) — нова картинка
             ckey, fh = None, None
-            if bp and s.get("state") == "GENERATING":   # під час роботи — окрема картка (детектив / режисер)
+            if bp and s.get("state") == "GENERATING" and not is_video(path):   # немає відео-вікна — картка Біпі
                 ckey, src = card_media(bp[0], bp[1], s["lang"])
-            else:   # на кроці — чиста картинка; фраза Біпі з'явиться рядком у підписі
-                src = _photo_ids.get(path)
-                fh = None if src else open(path, "rb")
+                media = tg_types.InputMediaPhoto(src, caption=text[:1020] or None, parse_mode=mode if text else None)
+            else:   # на кроці — відео-вікно; фраза Біпі з'явиться рядком у підписі
+                media, fh = media_of(path, text, mode)
             try:
-                media = tg_types.InputMediaPhoto(src or fh, caption=text[:1020] or None, parse_mode=mode if text else None)
                 r = bot.edit_message_media(media, chat_id=s["chat_id"], message_id=s["msg_id"], reply_markup=kb)
             finally:
                 if fh:
@@ -818,10 +802,7 @@ def ui(s):
             if ckey:
                 _remember_card(ckey, r)
             else:
-                try:
-                    _photo_ids[path] = r.photo[-1].file_id
-                except Exception:
-                    pass
+                remember_file(path, r)
             s["pic"], s["pic_key"] = want, pkey
             return
         if s.get("photo"):   # панель-картинка: текст живе в підписі (до 1024 символів)
@@ -2746,8 +2727,7 @@ def picture(name, L):
 
 def send_picture(chat_id, path, caption, reply_markup=None):
     try:
-        with open(path, "rb") as f:
-            bot.send_photo(chat_id, f, caption=caption, parse_mode="Markdown", reply_markup=reply_markup)
+        send_media(chat_id, path, caption, "Markdown", reply_markup=reply_markup)
         return True
     except Exception as e:
         log(f"Картинка {os.path.basename(path)} не надіслалась: {e}")
@@ -2816,31 +2796,18 @@ _screen_tok = {}   # (чат, повідомлення) → лічильник, 
 
 def show_screen(call, path, caption, kb, parse_mode="Markdown", bipi=None):
     """Міняє картинку й текст у тому самому повідомленні-заставці (нічого не «втікає» вгору).
-    bipi=(образ, блок фраз): на картинці з розкладкою Біпі вистрибне за 2 с; інакше — картка з Біпі."""
+    bipi=(образ, блок фраз): через BIPI_DELAY секунд у підписі з'явиться рядок Біпі (картинка не міняється)."""
     if not path or getattr(call.message, "content_type", "photo") not in ("photo", "animation"):
         return False
     L = user_lang(call.from_user)
     chat_id, mid = call.message.chat.id, call.message.message_id
     bp = (bipi[0], ph.pick(call.from_user.id, bipi[1], L)) if (bipi and BIPI_ON) else None
-    as_card = False
     _screen_tok[(chat_id, mid)] = tok = _screen_tok.get((chat_id, mid), 0) + 1
     for mode in (parse_mode, None):
-        ckey, fh = None, None
-        if as_card:
-            ckey, src = card_media(bp[0], bp[1], L)
-        else:
-            src = _photo_ids.get(path)
-            fh = None if src else open(path, "rb")
+        media, fh = media_of(path, caption, mode)
         try:
-            r = bot.edit_message_media(tg_types.InputMediaPhoto(src or fh, caption=caption[:1020], parse_mode=mode),
-                                       chat_id=chat_id, message_id=mid, reply_markup=kb)
-            if ckey:
-                _remember_card(ckey, r)
-            else:
-                try:
-                    _photo_ids[path] = r.photo[-1].file_id
-                except Exception:
-                    pass
+            r = bot.edit_message_media(media, chat_id=chat_id, message_id=mid, reply_markup=kb)
+            remember_file(path, r)
             if bp:
                 def reveal(cap=caption, m=mode):
                     if _screen_tok.get((chat_id, mid)) != tok:
@@ -2898,17 +2865,15 @@ def intro_media(L, step, caption, mode):
         fh = None if _intro_anim[0] else open(INTRO_VIDEO, "rb")
         return tg_types.InputMediaAnimation(_intro_anim[0] or fh, caption=caption, parse_mode=mode,
                                             width=1080, height=560), fh
-    path = intro_pic(step, L)
-    fh = None if _photo_ids.get(path) else open(path, "rb")
-    return tg_types.InputMediaPhoto(_photo_ids.get(path) or fh, caption=caption, parse_mode=mode), fh
+    return media_of(intro_pic(step, L), caption, mode)
 
 
 def remember_media(r, step, L):
     try:
         if step == 0 and getattr(r, "animation", None):
             _intro_anim[0] = r.animation.file_id
-        elif getattr(r, "photo", None):
-            _photo_ids[intro_pic(step, L)] = r.photo[-1].file_id
+        elif step > 0:
+            remember_file(intro_pic(step, L), r)
     except Exception:
         pass
 
@@ -3555,12 +3520,67 @@ STATE_PIC = {
 }
 
 
+# Кожен крок — відео-вікно 1080×880 (w_cat_uk.mp4 …); немає відео — стара картинка.
+VIDEO_OF = {"pic_cat": "w_cat", "pic_style": "w_film", "pic_astyle": "w_anim", "pic_dance": "w_dance",
+            "pic_genre": "w_genre", "pic_sound": "w_sound", "pic_music": "w_music", "pic_voice": "w_voice",
+            "pic_model": "w_model", "pic_clarify": "w_clarify", "pic_confirm": "w_confirm", "pic_gen": "w_gen",
+            "pic_prompt": "w_prompt", "pic_done": "w_done", "welcome": "w_send"}
+
+
 def pic_path(key, L):
+    if key == "pic_format" and billboard(L):
+        return billboard(L)
+    if key in VIDEO_OF:
+        for lang in (L, "en", "uk"):
+            p = os.path.join(HERE, f"{VIDEO_OF[key]}_{lang}.mp4")
+            if os.path.exists(p):
+                return p
     for lang in (L, "en", "uk"):
         p = os.path.join(HERE, f"{key}_{lang}.jpg")
         if os.path.exists(p):
             return p
     return None
+
+
+def is_video(path):
+    return bool(path) and path.endswith(".mp4")
+
+
+def media_of(path, caption=None, mode=None):
+    """(InputMedia для edit_message_media, відкритий файл або None). Файл, уже відомий Telegram, — за file_id."""
+    fid = _photo_ids.get(path)
+    fh = None if fid else open(path, "rb")
+    cap = (caption or "")[:1020] or None
+    if is_video(path):
+        return tg_types.InputMediaAnimation(fid or fh, caption=cap, parse_mode=mode if cap else None,
+                                            width=1080, height=880), fh
+    return tg_types.InputMediaPhoto(fid or fh, caption=cap, parse_mode=mode if cap else None), fh
+
+
+def remember_file(path, r):
+    try:
+        _photo_ids[path] = r.animation.file_id if is_video(path) else r.photo[-1].file_id
+    except Exception:
+        pass
+
+
+def send_media(chat_id, path, caption=None, mode=None, reply_markup=None, reply_to=None):
+    """Нове повідомлення з картинкою або відео-вікном."""
+    fid = _photo_ids.get(path)
+    fh = None if fid else open(path, "rb")
+    cap = (caption or "")[:1020] or None
+    try:
+        if is_video(path):
+            r = bot.send_animation(chat_id, fid or fh, caption=cap, parse_mode=mode if cap else None,
+                                   reply_markup=reply_markup, reply_to_message_id=reply_to, width=1080, height=880)
+        else:
+            r = bot.send_photo(chat_id, fid or fh, caption=cap, parse_mode=mode if cap else None,
+                               reply_markup=reply_markup, reply_to_message_id=reply_to)
+    finally:
+        if fh:
+            fh.close()
+    remember_file(path, r)
+    return r
 
 
 _bb_ids = {}   # шлях білборда → file_id у Telegram (удруге файл не вантажимо)
@@ -3569,37 +3589,12 @@ _bb_ids = {}   # шлях білборда → file_id у Telegram (удруге
 def send_panel(chat_id, L="uk", reply_to=None, key="pic_format"):
     """Нова панель вибору: картинка кроку зверху + короткий підпис. Повертає (повідомлення, чи_фото).
     Перший крок нового ролика («Що робимо?») — відео-білборд «було → стало» з кнопками під ним."""
-    bb = billboard(L) if key == "pic_format" else None
-    if bb:
-        fid = _bb_ids.get(bb)
-        fh = None if fid else open(bb, "rb")
-        try:
-            msg = bot.send_animation(chat_id, fid or fh, reply_to_message_id=reply_to, width=1080, height=880)
-            try:
-                _bb_ids[bb] = msg.animation.file_id
-            except Exception:
-                pass
-            return msg, True
-        except Exception as e:
-            log(f"Панель-відео не надіслалась: {e}")
-        finally:
-            if fh:
-                fh.close()
     path = pic_path(key, L)
     if path:
         try:
-            if path in _photo_ids:
-                msg = bot.send_photo(chat_id, _photo_ids[path], caption="🎬 ...", reply_to_message_id=reply_to)
-            else:
-                with open(path, "rb") as f:
-                    msg = bot.send_photo(chat_id, f, caption="🎬 ...", reply_to_message_id=reply_to)
-                try:
-                    _photo_ids[path] = msg.photo[-1].file_id
-                except Exception:
-                    pass
-            return msg, True
+            return send_media(chat_id, path, None if is_video(path) else "🎬 ...", reply_to=reply_to), True
         except Exception as e:
-            log(f"Панель-картинка не надіслалась: {e}")
+            log(f"Панель не надіслалась: {e}")
     return bot.send_message(chat_id, "🎬 ...", reply_to_message_id=reply_to), False
 
 
