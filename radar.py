@@ -50,10 +50,12 @@ def log(msg):
     print(msg, flush=True)
 
 def fb_url(url, is_write=False):
-    """Формує коректний URL для Firebase з параметром auth тільки за наявності секрету."""
+    """Формує коректний URL для Firebase з параметром auth за наявності секрету."""
     if not url:
         return ""
-    if is_write and FIREBASE_SECRET:
+    if "auth=" in url:
+        return url
+    if FIREBASE_SECRET:
         sep = "&" if "?" in url else "?"
         return f"{url}{sep}auth={FIREBASE_SECRET}"
     return url
@@ -61,11 +63,13 @@ def fb_url(url, is_write=False):
 def fb_request(method, url, **kwargs):
     """
     Виконує надійний HTTP-запит до Firebase:
-    - Заголовок Connection: close запобігає зависанню застарілих TLS-сокетів після паузи.
-    - Автоматично повторює спробу при виникненні SSLEOFError, ConnectionError або Timeout.
+    - Автоматично підставляє auth-секрет до будь-яких запитів (читання та запис).
+    - Заголовок Connection: close запобігає зависанню TLS-сокетів.
+    - Автоматично повторює спробу при збоях мережі.
     """
     if not url:
         return None
+    url = fb_url(url)
     headers = kwargs.pop("headers", {}) or {}
     if "Connection" not in headers:
         headers["Connection"] = "close"
