@@ -3,17 +3,12 @@ import re
 import json
 import time
 import random
-import asyncio
 import requests
 from urllib.parse import unquote
 from datetime import datetime, timezone, timedelta
 
-from telethon import TelegramClient
-from telethon.sessions import StringSession
-
 UA_TZ = timezone(timedelta(hours=3))
 
-# ================= НАСТРОЙКИ СЕКРЕТОВ И ОКРУЖЕНИЯ =================
 RAW_GEMINI_KEYS = os.environ.get("GEMINI_KEY", "").strip() or os.environ.get("GEMINI_KEYS", "").strip()
 GEMINI_KEYS = [k.strip() for k in re.split(r'[,;\s]+', RAW_GEMINI_KEYS) if len(k.strip()) > 15]
 
@@ -25,6 +20,7 @@ SUPPORTED_MODELS = [
 ]
 
 FIREBASE_URL = os.environ.get("FIREBASE_URL", "").strip()
+# За замовчуванням порожній рядок, щоб не викликати помилку 401 на відкритій базі
 FIREBASE_SECRET = os.environ.get("FIREBASE_SECRET", "").strip()
 
 if FIREBASE_URL and not FIREBASE_URL.endswith(".json"):
@@ -39,23 +35,9 @@ CUSTOM_STREETS_URL = f"{BASE_FB_URL}/custom_streets.json" if BASE_FB_URL else ""
 STREET_OVERRIDES_URL = f"{BASE_FB_URL}/street_overrides.json" if BASE_FB_URL else ""
 SPAM_FILTERS_URL = f"{BASE_FB_URL}/spam_filters.json" if BASE_FB_URL else ""
 TRAFFIC_STATS_HISTORY_URL = f"{BASE_FB_URL}/config/traffic_stats_history.json" if BASE_FB_URL else ""
-GROUP_STATUS_URL = f"{BASE_FB_URL}/config/group_status.json" if BASE_FB_URL else ""
 
 LIFETIME_MS = 40 * 60 * 1000
 CHANNEL_BASE_URL = "https://t.me/s/dnepr_bez_tck"
-
-# Секреты для чтения группы Telegram
-TG_API_ID = os.environ.get("TG_API_ID", "").strip()
-TG_API_HASH = os.environ.get("TG_API_HASH", "").strip()
-TG_SESSION_STRING = os.environ.get("TG_SESSION_STRING", "").strip()
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
-
-tg_client = None
-if TG_API_ID and TG_API_HASH and TG_SESSION_STRING:
-    try:
-        tg_client = TelegramClient(StringSession(TG_SESSION_STRING), int(TG_API_ID), TG_API_HASH)
-    except Exception as e:
-        print(f"⚠️ Помилка ініціалізації Telethon: {e}", flush=True)
 
 PROCESSED_POST_IDS = set()
 CUSTOM_STREETS_CACHE = {}
@@ -63,8 +45,6 @@ STREET_OVERRIDES_CACHE = {}
 DYNAMIC_SPAM_WORDS = set()
 LAST_CLOUD_SYNC = 0
 LAST_STATS_AGGREGATION = 0
-LAST_GROUP_STATUS = None
-LAST_GROUP_STATUS_TIME = 0
 
 def log(msg):
     print(msg, flush=True)
@@ -79,6 +59,11 @@ def fb_url(url, is_write=False):
     return url
 
 def fb_request(method, url, **kwargs):
+    """
+    Виконує надійний HTTP-запит до Firebase:
+    - Заголовок Connection: close запобігає зависанню застарілих TLS-сокетів після паузи.
+    - Автоматично повторює спробу при виникненні SSLEOFError, ConnectionError або Timeout.
+    """
     if not url:
         return None
     headers = kwargs.pop("headers", {}) or {}
@@ -98,28 +83,8 @@ def fb_request(method, url, **kwargs):
     return None
 
 def sanitize_fb_key(raw_str):
+    """Очищає ключ від заборонених у Firebase символів."""
     return re.sub(r'[\.\$\#\[\]\/]', '_', str(raw_str))
-
-def update_group_status(is_online, error_msg=""):
-    """Записує стан працездатності групи у Firebase для сповіщення карти."""
-    global LAST_GROUP_STATUS, LAST_GROUP_STATUS_TIME
-    if not GROUP_STATUS_URL:
-        return
-    now = time.time()
-    # Оновлюємо статус при зміні стану або раз на 5 хвилин для підтвердження активності
-    if LAST_GROUP_STATUS == is_online and (now - LAST_GROUP_STATUS_TIME) < 300:
-        return
-    try:
-        payload = {
-            "online": bool(is_online),
-            "error": str(error_msg or "")[:250],
-            "updated_at": int(now * 1000)
-        }
-        fb_request("PUT", fb_url(GROUP_STATUS_URL, is_write=True), json=payload, timeout=6)
-        LAST_GROUP_STATUS = is_online
-        LAST_GROUP_STATUS_TIME = now
-    except Exception as e:
-        log(f"⚠️ Помилка запису статусу групи: {e}")
 
 def get_active_gemini_key():
     global current_key_index
@@ -199,7 +164,9 @@ TARGET_CHECKPOINTS_CONFIG = [
 ]
 
 LOCAL_STREETS_DB = [
+    # Каштанова — віадук Слобожанського проспекту (Лівий берег)
     {"keys": ["каштанов", "каштановая", "віадук каштанов", "виадук каштанов"], "addr": "вул. Каштанова (віадук / Слобожанський)", "lat": 48.5035, "lng": 35.0838},
+
     {"keys": ["славянк", "словянк"], "addr": "ТЦ Слов'янський (Слов'янка)", "lat": 48.4715, "lng": 35.0135},
     {"keys": ["озерк"], "addr": "Ринок Озерка", "lat": 48.4715, "lng": 35.0215},
     {"keys": ["курчатовск.*рынок", "курчатовськ.*ринок", "курчатовск", "курчатовськ", "128.*бригад"], "addr": "вул. 128-ї Бригади (Курчатовський)", "lat": 48.4740, "lng": 35.0140},
@@ -207,6 +174,7 @@ LOCAL_STREETS_DB = [
     {"keys": ["автовокзал"], "addr": "Центральний Автовокзал (вул. Курчатова)", "lat": 48.4735, "lng": 35.0100},
     {"keys": ["південн.*вокзал", "южн.*вокзал"], "addr": "Південний вокзал (вул. Лоцманська)", "lat": 48.4390, "lng": 35.0800},
     {"keys": ["старомостов", "островськ", "островск"], "addr": "пл. Старомостова (Островського)", "lat": 48.4770, "lng": 35.0220},
+
     {"keys": ["парус.*стрилиц", "парус.*стрелиц", "стрилиц", "стрелиц"], "addr": "ж/м Парус (Стрелиця / коса)", "lat": 48.4870, "lng": 34.9120},
     {"keys": ["трофимов", "трофімов"], "addr": "вул. Велика Діївська (Братів Трофімових)", "lat": 48.4840, "lng": 34.9180},
     {"keys": ["диевк", "діївк", "диевка 1", "диевка 2", "діївська"], "addr": "ж/м Діївка", "lat": 48.4810, "lng": 34.8980},
@@ -215,16 +183,19 @@ LOCAL_STREETS_DB = [
     {"keys": ["покровськ", "покровск", "комунар", "коммунар"], "addr": "ж/м Покровський (Комунар)", "lat": 48.4820, "lng": 34.9380},
     {"keys": ["червон.*кам", "красный камень"], "addr": "ж/м Червоний Камінь", "lat": 48.4830, "lng": 34.9520},
     {"keys": ["західн", "западн"], "addr": "ж/м Західний", "lat": 48.4650, "lng": 34.9350},
+
     {"keys": ["космичк", "космічк", "космическ", "космічн"], "addr": "вул. Космічна", "lat": 48.4180, "lng": 35.0450},
     {"keys": ["низ космическ", "низ космічн", "низ космичк"], "addr": "вул. Космічна (Низ, Набережна)", "lat": 48.4240, "lng": 35.0740},
     {"keys": ["верх космическ", "верх космічн", "верх космичк"], "addr": "вул. Космічна (Верх, Запорізьке шосе)", "lat": 48.4060, "lng": 35.0410},
     {"keys": ["тещин.*язик", "тещин.*язык"], "addr": "Тьощин язик (вул. Космічна)", "lat": 48.4140, "lng": 35.0510},
     {"keys": ["высоковольтн.*ям", "високовольтн.*ям", "высоковольтн", "високовольтн"], "addr": "вул. Високовольтна (р-н Ями / Гагаріна)", "lat": 48.4270, "lng": 35.0450},
+
     {"keys": ["шинн", "шинная"], "addr": "вул. Шинна", "lat": 48.4180, "lng": 35.0150},
     {"keys": ["мирный", "мирний", "пос.*мирн"], "addr": "пос. Мирний (Сурсько-Литовське шосе)", "lat": 48.3980, "lng": 34.9850},
     {"keys": ["переезд.*мирн", "переїзд.*мирн"], "addr": "Переїзд Мирний (Краснопілля)", "lat": 48.3980, "lng": 34.9850},
     {"keys": ["12.*квартал", "12 квартал", "квартал"], "addr": "12 Квартал (просп. Б. Хмельницького)", "lat": 48.4120, "lng": 35.0150},
     {"keys": ["кротов", "гальченк"], "addr": "вул. Бориса Кротова / Гальченка", "lat": 48.4030, "lng": 35.0060},
+
     {"keys": ["остров.*слобожан", "острова.*правд", "остров", "острови"], "addr": "ж/м Смарагдовий (Острови, Слобожанське)", "lat": 48.5320, "lng": 35.0850},
     {"keys": ["слобожанск", "слобожанськ", "правд"], "addr": "просп. Слобожанський (Правди)", "lat": 48.5000, "lng": 35.0680},
     {"keys": ["бык", "бик"], "addr": "Пост «Бик» (Підгородне)", "lat": 48.5350, "lng": 35.1020},
@@ -236,6 +207,7 @@ LOCAL_STREETS_DB = [
     {"keys": ["берегов"], "addr": "вул. Берегова (АНД)", "lat": 48.4980, "lng": 35.0250},
     {"keys": ["отечествен", "вітчизнян"], "addr": "вул. Вітчизняна (АНД)", "lat": 48.5050, "lng": 35.0350},
     {"keys": ["гринченк"], "addr": "вул. Миколи Грінченка", "lat": 48.5020, "lng": 35.0420},
+
     {"keys": ["низ киров", "низ кіров", "низ поля"], "addr": "просп. Олександра Поля (Низ, сквер Героїв)", "lat": 48.4610, "lng": 35.0310},
     {"keys": ["середина киров", "середина кіров", "середина поля"], "addr": "просп. Олександра Поля (Середина, Славутич)", "lat": 48.4480, "lng": 35.0240},
     {"keys": ["верх киров", "верх кіров", "верх поля"], "addr": "просп. Олександра Поля (Верх, Титова)", "lat": 48.4340, "lng": 35.0160},
@@ -253,6 +225,7 @@ LOCAL_STREETS_DB = [
     {"keys": ["карла маркс", "яворниц", "яворницьк"], "addr": "просп. Дмитра Яворницького (К. Маркса)", "lat": 48.4650, "lng": 35.0350},
     {"keys": ["артем", "січов", "сечевых"], "addr": "вул. Січових Стрільців (Артема)", "lat": 48.4550, "lng": 35.0420},
     {"keys": ["савченк", "черновол", "чорновол"], "addr": "вул. В'ячеслава Чорновола (Савченка)", "lat": 48.4550, "lng": 35.0180},
+    
     {"keys": ["канатн", "інфекцій", "инфекцион", "21 лікарн", "21 больниц"], "addr": "вул. Канатна (Інфекційна лікарня №21)", "lat": 48.46350, "lng": 35.00980},
     {"keys": ["щепкін", "щепкин"], "addr": "вул. Щепкіна", "lat": 48.47350, "lng": 34.99680},
     {"keys": ["павлов"], "addr": "вул. Академіка Павлова", "lat": 48.48022, "lng": 35.00658},
@@ -269,12 +242,6 @@ LOCAL_STREETS_DB = [
 ]
 
 QUESTION_EMOJIS = ['?', '❓', '❔', '⁉️', '🤔', '🧐', '🙏']
-QUESTION_WORDS = [
-    "подскажите", "підкажіть", "как там", "як там",
-    "что по", "шо по", "хто знає", "кто знает", "чисто?",
-    "актуально", "аудиосообщение принято"
-]
-
 CLOUD_PRECIP_EMOJIS = ['🌤️', '⛅', '🌥️', '🌦️', '☁️', '🌧️', '⛈️', '🌩️', '🌨️', '🌪️', '🌫️', '☔', '💧', '💦']
 SUN_ONLY_EMOJIS = ['☀️', '🌞', '🌈', '🍏', '🟢']
 
@@ -299,12 +266,7 @@ DANGER_KEYWORDS = [
 ]
 
 def is_ignored_question(text):
-    if not text:
-        return False
-    if any(q in text for q in QUESTION_EMOJIS):
-        return True
-    t_lower = text.lower()
-    return any(qw in t_lower for qw in QUESTION_WORDS)
+    return any(q in text for q in QUESTION_EMOJIS)
 
 def has_meaningful_context(text):
     t = text.lower()
@@ -409,6 +371,7 @@ def geocode_local(text):
     clean_t = text.lower().replace('ё', 'е')
     t = " " + clean_t + " "
 
+    # 0. Ручні зсуви з папки street_overrides (захищено від некоректних типів)
     for raw_key, data in STREET_OVERRIDES_CACHE.items():
         if isinstance(data, dict):
             st_name = (data.get("street") or data.get("name") or "").lower().replace('ё', 'е')
@@ -420,6 +383,7 @@ def geocode_local(text):
                 except (ValueError, TypeError):
                     continue
 
+    # Жорстка фіксація вул. Каштанової на Лівому березі (віадук Слобожанського)
     if re.search(r'(?:каштанов)', t):
         return "вул. Каштанова (віадук / Слобожанський)", 48.5035, 35.0838
 
@@ -473,11 +437,20 @@ def geocode_local(text):
 
     return None, None, None
 
+
+# ======================================================================
+# ПОВНИЙ СПИСОК ВУЛИЦЬ ДНІПРА (з OpenStreetMap, файл streets_dnipro.json)
+# Працює ЛИШЕ як запасний варіант: після ручних правил, бази знань і Nominatim,
+# але перед Gemini. Усе, що радар вже вмів знаходити, лишається як було.
+#   "log" — тільки пише в журнал, що знайшов би (точки НЕ змінюються)
+#   "on"  — реально ставить точку за списком
+#   "off" — вимкнено
+# ======================================================================
 STREETS_LIST_MODE = "log"
 STREETS_LIST_URL = "https://radar-core-test.web.app/streets_dnipro.json"
 STREETS_REFRESH_SEC = 6 * 3600
-MIN_CORE_LEN = 5
-MIN_SURNAME_LEN = 6
+MIN_CORE_LEN = 5          # мінімальна довжина назви для пошуку
+MIN_SURNAME_LEN = 6       # мінімальна довжина прізвища, якщо в пості тільки воно
 
 STREET_TYPE_WORDS = {
     "вулиця", "вул", "улица", "ул", "проспект", "просп", "пр", "провулок", "пров", "переулок", "пер",
@@ -485,6 +458,7 @@ STREET_TYPE_WORDS = {
     "узвіз", "спуск", "тупик", "тупік", "проїзд", "проезд", "алея", "аллея", "майдан", "дорога",
     "міст", "мост", "в'їзд", "виїзд", "лінія", "линия", "імені", "имени", "им", "ім"
 }
+# слова, які в постах зустрічаються як звичайні слова, а не як вулиці
 STREET_STOP_WORDS = {
     "чисто", "пусто", "вільно", "свободно", "центр", "центральна", "центральная", "головна", "главная",
     "нова", "новая", "стара", "старая", "лісова", "лесная", "садова", "садовая", "річкова", "речная",
@@ -492,6 +466,7 @@ STREET_STOP_WORDS = {
 }
 
 STREETS_INDEX = {"full": {}, "surname": {}, "loaded_at": 0}
+
 
 def street_norm(text):
     t = str(text or "").lower()
@@ -502,12 +477,15 @@ def street_norm(text):
     t = re.sub(r"[^a-zа-я0-9\s-]", " ", t)
     return re.sub(r"\s+", " ", t).strip()
 
+
 NORM_TYPE_WORDS = {street_norm(w) for w in STREET_TYPE_WORDS}
 NORM_STOP_WORDS = {street_norm(w) for w in STREET_STOP_WORDS}
 STEM_ENDINGS = ("ий", "ый", "ой", "ая", "яя", "ое", "ее", "ою", "а", "я", "у", "ю", "о", "е", "и")
 
+
 def street_core_tokens(name):
     return [w for w in street_norm(name).split(" ") if w and w not in NORM_TYPE_WORDS]
+
 
 def street_stem(tok):
     for end in STEM_ENDINGS:
@@ -515,7 +493,9 @@ def street_stem(tok):
             return tok[:-len(end)]
     return tok
 
+
 def load_streets_index(force=False):
+    """Завантажує streets_dnipro.json з сайту і будує індекс. Помилка = просто без списку."""
     if STREETS_LIST_MODE == "off":
         return
     now = time.time()
@@ -532,14 +512,16 @@ def load_streets_index(force=False):
         log(f"🗂️ [СПИСОК ВУЛИЦЬ]: завантажено {len(streets)} записів, для пошуку придатно: "
             f"{len(STREETS_INDEX['full'])} назв + {len(STREETS_INDEX['surname'])} прізвищ (режим: {STREETS_LIST_MODE})")
     except Exception as e:
-        STREETS_INDEX["loaded_at"] = now - STREETS_REFRESH_SEC + 600
+        STREETS_INDEX["loaded_at"] = now - STREETS_REFRESH_SEC + 600  # повторимо через 10 хв
         log(f"⚠️ [СПИСОК ВУЛИЦЬ]: не вдалося завантажити ({e}) — працюємо без нього")
 
+
 def build_streets_index(streets):
+    """Індекс за основами слів. У нього потрапляє тільки те, що вказує РІВНО на одну вулицю."""
     records = []
-    cand = {}
-    sur_cand = {}
-    stem_usage = {}
+    cand = {}        # "основа основа" -> множина id записів
+    sur_cand = {}    # основа прізвища -> множина id записів
+    stem_usage = {}  # будь-яка основа слова -> множина id записів, де вона трапляється
     for st in streets:
         try:
             rec = {"n": st["n"], "la": float(st["la"]), "ln": float(st["ln"])}
@@ -565,6 +547,7 @@ def build_streets_index(streets):
     for key, ids in cand.items():
         if len(ids) != 1:
             continue
+        # одне слово (напр. "Шевченка") не можна брати, якщо воно є ще в чиїйсь назві
         if " " not in key and len(stem_usage.get(key, ids)) != 1:
             continue
         full[key] = records[next(iter(ids))]
@@ -574,7 +557,9 @@ def build_streets_index(streets):
     STREETS_INDEX["full"] = full
     STREETS_INDEX["surname"] = surname
 
+
 def geocode_streets_list(text):
+    """Повертає (адреса, lat, lng) або (None, None, None). Тільки однозначні збіги."""
     if STREETS_LIST_MODE == "off":
         return None, None, None
     load_streets_index()
@@ -583,7 +568,7 @@ def geocode_streets_list(text):
         return None, None, None
 
     t = " " + street_norm(text) + " "
-    best = None
+    best = None  # (довжина збігу, запис)
 
     for key, rec in full.items():
         pat = r"(?<![a-zа-я0-9])" + r"\s+".join(re.escape(x) + r"[a-zа-я]{0,3}" for x in key.split(" ")) + r"(?![a-zа-я0-9])"
@@ -599,6 +584,7 @@ def geocode_streets_list(text):
         return None, None, None
     rec = best[1]
     return rec["n"], round(rec["la"], 5), round(rec["ln"], 5)
+
 
 def geocode_osm_fallback(text):
     clean = re.sub(r'(?:чисто|пусто|вільно|спокійно|спокойно|норм|нормально|бп|блокпост|патруль|роздають|хмари|сині|дощ|сонце|сонечко|без\s*ям|без\s*бп|нет\s*бп|🌞|☀️)\b', '', text, flags=re.I).strip()
@@ -848,61 +834,7 @@ def fetch_channel_messages():
 
         return results
     except Exception as e:
-        log(f"⚠️ Помилка зчитування відкритого Telegram-каналу: {e}")
-        return []
-
-async def _fetch_group_messages_async():
-    """Асинхронно зчитує останні повідомлення із закритої групи через Telethon."""
-    if not tg_client or not TG_CHAT_ID:
-        update_group_status(False, "Telethon не налаштовано або відсутній TG_CHAT_ID")
-        return []
-
-    if not tg_client.is_connected():
-        try:
-            await tg_client.connect()
-        except Exception as conn_err:
-            log(f"⚠️ Помилка підключення Telethon: {conn_err}")
-            update_group_status(False, f"Помилка підключення: {conn_err}")
-            return []
-
-    chat_target = int(TG_CHAT_ID) if TG_CHAT_ID.lstrip('-').isdigit() else TG_CHAT_ID
-    results = []
-    now_ms = int(time.time() * 1000)
-
-    try:
-        async for m in tg_client.iter_messages(chat_target, limit=20):
-            text = m.raw_text or ""
-            if not text.strip():
-                continue
-
-            post_time_ms = int(m.date.timestamp() * 1000) if m.date else now_ms
-
-            if is_ad_or_spam(text) or is_ignored_question(text):
-                continue
-
-            sub_reports = split_multiline_reports(text)
-            for idx, report_line in enumerate(sub_reports):
-                if not is_ad_or_spam(report_line) and not is_ignored_question(report_line):
-                    sub_post_id = f"grp_{m.id}_{idx}" if len(sub_reports) > 1 else f"grp_{m.id}"
-                    results.append((sub_post_id, report_line, post_time_ms))
-
-        update_group_status(True, "")
-    except Exception as err:
-        log(f"⚠️ Помилка в ітерації повідомлень Telethon: {err}")
-        update_group_status(False, f"Помилка читання: {err}")
-
-    return results
-
-def fetch_group_messages():
-    """Синхронна обгортка для читання групи Telethon."""
-    if not tg_client or not TG_CHAT_ID:
-        update_group_status(False, "Telethon не налаштовано або відсутній TG_CHAT_ID")
-        return []
-    try:
-        return tg_client.loop.run_until_complete(_fetch_group_messages_async())
-    except Exception as e:
-        log(f"⚠️ [TELETHON]: Помилка читання групи: {e}")
-        update_group_status(False, f"Збій loop: {e}")
+        log(f"⚠️ Помилка зчитування Telegram: {e}")
         return []
 
 def parse_batch_with_gemini(items_to_parse):
@@ -971,8 +903,8 @@ def save_point_to_firebase(sub_post_id, msg, parsed_result, is_clean, post_time_
         display_text = f"{msg} (чисто)"
 
     safe_id = sanitize_fb_key(f"tg_{sub_post_id}")
-    source_type = "group" if str(sub_post_id).startswith("grp_") else "channel"
 
+    # 1. Запис на живу карту тільки повідомлень молодше 40 хвилин
     if POINTS_URL and (now_ms - post_time_ms) <= LIFETIME_MS:
         point_data = {
             "text": display_text,
@@ -983,7 +915,6 @@ def save_point_to_firebase(sub_post_id, msg, parsed_result, is_clean, post_time_
             "color": color,
             "status": "чисто" if status_clean else "опасно",
             "is_clean": status_clean,
-            "source": source_type,
             "geo_refined": True,
             "needs_training": parsed_result.get("needs_training", False),
             "time": post_time_ms,
@@ -995,6 +926,7 @@ def save_point_to_firebase(sub_post_id, msg, parsed_result, is_clean, post_time_
         except Exception as e:
             log(f"⚠️ Помилка запису в Firebase points: {e}")
 
+    # 2. Запис в архів за унікальним ключем tg_{sub_post_id}
     if STATS_ARCHIVE_URL:
         try:
             archive_entry = {
@@ -1003,7 +935,6 @@ def save_point_to_firebase(sub_post_id, msg, parsed_result, is_clean, post_time_
                 "lat": parsed_result["lat"],
                 "lng": parsed_result["lng"],
                 "is_clean": status_clean,
-                "source": source_type,
                 "time": post_time_ms
             }
             target_arch_url = STATS_ARCHIVE_URL.replace(".json", f"/{safe_id}.json")
@@ -1012,6 +943,7 @@ def save_point_to_firebase(sub_post_id, msg, parsed_result, is_clean, post_time_
             pass
 
 def preload_existing_ids():
+    """Завантажує вже оброблені ID при старті скрипта для економії запитів Gemini."""
     global PROCESSED_POST_IDS
     if not BASE_FB_URL:
         return
@@ -1039,10 +971,7 @@ def sync_cycle():
     update_traffic_stats_history()
 
     kb_list = get_knowledge_base()
-
-    channel_items = fetch_channel_messages()
-    group_items = fetch_group_messages()
-    items = channel_items + group_items
+    items = fetch_channel_messages()
 
     if not items:
         return
@@ -1053,7 +982,7 @@ def sync_cycle():
         if safe_check_id not in PROCESSED_POST_IDS:
             new_items.append((safe_check_id, text, post_time_ms))
 
-    log(f"📢 З каналу: {len(channel_items)} | З групи: {len(group_items)} | Нових: {len(new_items)} | В базі знань: {len(kb_list)}")
+    log(f"📢 В каналі: {len(items)} | Нових: {len(new_items)} | В базі знань: {len(kb_list)} | Хмарних правил: {len(CUSTOM_STREETS_CACHE)} | Спам-фільтрів: {len(DYNAMIC_SPAM_WORDS)}")
 
     if not new_items:
         return
@@ -1174,7 +1103,7 @@ def sync_cycle():
             save_point_to_firebase(sub_post_id, msg, parsed_result, is_clean, post_time_ms)
 
 if __name__ == "__main__":
-    log(f"🚀 Запуск оновленого радара 24/7 v5.8 (Telethon + Channel + Gemini)...")
+    log(f"🚀 Запуск оновленого радара 24/7 v5.6 (Завантажено {len(GEMINI_KEYS)} API ключів)...")
     start_time = time.time()
     MAX_RUNTIME_SEC = 5 * 3600 + 40 * 60
 
@@ -1185,17 +1114,9 @@ if __name__ == "__main__":
     except Exception as e:
         log(f"⚠️ Стартова агрегація статистики: {e}")
 
-    try:
-        while (time.time() - start_time) < MAX_RUNTIME_SEC:
-            try:
-                sync_cycle()
-            except Exception as e:
-                log(f"⚠️ Помилка в циклі: {e}")
-            time.sleep(20)
-    finally:
-        if tg_client and tg_client.is_connected():
-            try:
-                tg_client.loop.run_until_complete(tg_client.disconnect())
-                log("🔌 Telethon безпечно відключено перед зміною раннера.")
-            except Exception:
-                pass
+    while (time.time() - start_time) < MAX_RUNTIME_SEC:
+        try:
+            sync_cycle()
+        except Exception as e:
+            log(f"⚠️ Помилка в циклі: {e}")
+        time.sleep(20)
