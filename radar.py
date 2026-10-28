@@ -39,6 +39,7 @@ CUSTOM_STREETS_URL = f"{BASE_FB_URL}/custom_streets.json" if BASE_FB_URL else ""
 STREET_OVERRIDES_URL = f"{BASE_FB_URL}/street_overrides.json" if BASE_FB_URL else ""
 SPAM_FILTERS_URL = f"{BASE_FB_URL}/spam_filters.json" if BASE_FB_URL else ""
 TRAFFIC_STATS_HISTORY_URL = f"{BASE_FB_URL}/config/traffic_stats_history.json" if BASE_FB_URL else ""
+GROUP_STATUS_URL = f"{BASE_FB_URL}/config/group_status.json" if BASE_FB_URL else ""
 
 LIFETIME_MS = 40 * 60 * 1000
 CHANNEL_BASE_URL = "https://t.me/s/dnepr_bez_tck"
@@ -62,6 +63,8 @@ STREET_OVERRIDES_CACHE = {}
 DYNAMIC_SPAM_WORDS = set()
 LAST_CLOUD_SYNC = 0
 LAST_STATS_AGGREGATION = 0
+LAST_GROUP_STATUS = None
+LAST_GROUP_STATUS_TIME = 0
 
 def log(msg):
     print(msg, flush=True)
@@ -96,6 +99,27 @@ def fb_request(method, url, **kwargs):
 
 def sanitize_fb_key(raw_str):
     return re.sub(r'[\.\$\#\[\]\/]', '_', str(raw_str))
+
+def update_group_status(is_online, error_msg=""):
+    """Записує стан працездатності групи у Firebase для сповіщення карти."""
+    global LAST_GROUP_STATUS, LAST_GROUP_STATUS_TIME
+    if not GROUP_STATUS_URL:
+        return
+    now = time.time()
+    # Оновлюємо статус при зміні стану або раз на 5 хвилин для підтвердження активності
+    if LAST_GROUP_STATUS == is_online and (now - LAST_GROUP_STATUS_TIME) < 300:
+        return
+    try:
+        payload = {
+            "online": bool(is_online),
+            "error": str(error_msg or "")[:250],
+            "updated_at": int(now * 1000)
+        }
+        fb_request("PUT", fb_url(GROUP_STATUS_URL, is_write=True), json=payload, timeout=6)
+        LAST_GROUP_STATUS = is_online
+        LAST_GROUP_STATUS_TIME = now
+    except Exception as e:
+        log(f"⚠️ Помилка запису статусу групи: {e}")
 
 def get_active_gemini_key():
     global current_key_index
@@ -830,9 +854,16 @@ def fetch_channel_messages():
 async def _fetch_group_messages_async():
     """Асинхронно зчитує останні повідомлення із закритої групи через Telethon."""
     if not tg_client or not TG_CHAT_ID:
+        update_group_status(False, "Telethon не налаштовано або відсутній TG_CHAT_ID")
         return []
+
     if not tg_client.is_connected():
-        await tg_client.connect()
+        try:
+            await tg_client.connect()
+        except Exception as conn_err:
+            log(f"⚠️ Помилка підключення Telethon: {conn_err}")
+            update_group_status(False, f"Помилка підключення: {conn_err}")
+            return []
 
     chat_target = int(TG_CHAT_ID) if TG_CHAT_ID.lstrip('-').isdigit() else TG_CHAT_ID
     results = []
@@ -854,19 +885,24 @@ async def _fetch_group_messages_async():
                 if not is_ad_or_spam(report_line) and not is_ignored_question(report_line):
                     sub_post_id = f"grp_{m.id}_{idx}" if len(sub_reports) > 1 else f"grp_{m.id}"
                     results.append((sub_post_id, report_line, post_time_ms))
+
+        update_group_status(True, "")
     except Exception as err:
         log(f"⚠️ Помилка в ітерації повідомлень Telethon: {err}")
+        update_group_status(False, f"Помилка читання: {err}")
 
     return results
 
 def fetch_group_messages():
     """Синхронна обгортка для читання групи Telethon."""
     if not tg_client or not TG_CHAT_ID:
+        update_group_status(False, "Telethon не налаштовано або відсутній TG_CHAT_ID")
         return []
     try:
         return tg_client.loop.run_until_complete(_fetch_group_messages_async())
     except Exception as e:
         log(f"⚠️ [TELETHON]: Помилка читання групи: {e}")
+        update_group_status(False, f"Збій loop: {e}")
         return []
 
 def parse_batch_with_gemini(items_to_parse):
@@ -1149,9 +1185,17 @@ if __name__ == "__main__":
     except Exception as e:
         log(f"⚠️ Стартова агрегація статистики: {e}")
 
-    while (time.time() - start_time) < MAX_RUNTIME_SEC:
-        try:
-            sync_cycle()
-        except Exception as e:
-            log(f"⚠️ Помилка в циклі: {e}")
-        time.sleep(20)
+    try:
+        while (time.time() - start_time) < MAX_RUNTIME_SEC:
+            try:
+                sync_cycle()
+            except Exception as e:
+                log(f"⚠️ Помилка в циклі: {e}")
+            time.sleep(20)
+    finally:
+        if tg_client and tg_client.is_connected():
+            try:
+                tg_client.loop.run_until_complete(tg_client.disconnect())
+                log("🔌 Telethon безпечно відключено перед зміною раннера.")
+            except Exception:
+                pass
