@@ -935,6 +935,7 @@ def save_point_to_firebase(sub_post_id, msg, parsed_result, is_clean, post_time_
         display_text = f"{msg} (чисто)"
 
     safe_id = sanitize_fb_key(f"tg_{sub_post_id}")
+    source_type = "group" if str(sub_post_id).startswith("grp_") else "channel"
 
     if POINTS_URL and (now_ms - post_time_ms) <= LIFETIME_MS:
         point_data = {
@@ -946,6 +947,7 @@ def save_point_to_firebase(sub_post_id, msg, parsed_result, is_clean, post_time_
             "color": color,
             "status": "чисто" if status_clean else "опасно",
             "is_clean": status_clean,
+            "source": source_type,
             "geo_refined": True,
             "needs_training": parsed_result.get("needs_training", False),
             "time": post_time_ms,
@@ -965,6 +967,7 @@ def save_point_to_firebase(sub_post_id, msg, parsed_result, is_clean, post_time_
                 "lat": parsed_result["lat"],
                 "lng": parsed_result["lng"],
                 "is_clean": status_clean,
+                "source": source_type,
                 "time": post_time_ms
             }
             target_arch_url = STATS_ARCHIVE_URL.replace(".json", f"/{safe_id}.json")
@@ -1001,7 +1004,6 @@ def sync_cycle():
 
     kb_list = get_knowledge_base()
 
-    # Отримуємо повідомлення з обох джерел
     channel_items = fetch_channel_messages()
     group_items = fetch_group_messages()
     items = channel_items + group_items
