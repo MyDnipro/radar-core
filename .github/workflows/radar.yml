@@ -1,21 +1,19 @@
 name: Radar 24/7 Sync
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: '0 */4 * * *'
+    # Запуск кожні 5 годин 40 хвилин (перекриває 6-годинний ліміт GitHub)
+    - cron: '0 */5 * * *'
+  workflow_dispatch:
 
 concurrency:
   group: radar-runner
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   run-radar:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-    permissions:
-      actions: write
-      contents: read
+    timeout-minutes: 350
 
     steps:
       - name: Клонування репозиторію
@@ -25,28 +23,26 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
-      - name: Встановлення бібліотек
+      - name: Встановлення залежностей
         run: |
           python -m pip install --upgrade pip
           pip install requests telethon
 
       - name: Запуск радара
         env:
-          GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
           FIREBASE_URL: ${{ secrets.FIREBASE_URL }}
           FIREBASE_SECRET: ${{ secrets.FIREBASE_SECRET }}
+          GEMINI_KEYS: ${{ secrets.GEMINI_KEYS }}
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
           TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: python radar.py
+        run: |
+          python radar.py
 
       - name: Автоматичний перезапуск наступної зміни
         if: always()
         run: |
-          curl -X POST \
-            -H "Accept: application/vnd.github.v3+json" \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            https://api.github.com/repos/MyDnipro/radar-core/actions/workflows/radar.yml/dispatches \
-            -d '{"ref":"main"}'
+          echo "Зміна завершена. Наступний цикл підхопить cron або workflow_dispatch."
