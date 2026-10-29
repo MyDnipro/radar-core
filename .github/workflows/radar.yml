@@ -1,18 +1,23 @@
 name: Radar 24/7 Sync
 
 on:
-  workflow_dispatch: # Запуск вручну та за запитом кнопки з веб-карти (не чіпаємо)
+  workflow_dispatch:
   schedule:
-    - cron: '0 */4 * * *' # Перезапуск кожні 4 години із запасом (без пауз і провисань)
+    - cron: '0 */4 * * *'
 
 concurrency:
   group: radar-runner
-  cancel-in-progress: true # Нова зміна безшовно замінює попередню без дублювання процесів
+  cancel-in-progress: true
+
+# ДОБАВЛЕНО: Даем права скрипту нажимать кнопку запуска
+permissions:
+  actions: write
+  contents: read
 
 jobs:
   run-radar:
     runs-on: ubuntu-latest
-    timeout-minutes: 360 # Максимальний ліміт GitHub Actions (6 годин)
+    timeout-minutes: 360
 
     steps:
       - name: Клонування репозиторію
@@ -33,4 +38,6 @@ jobs:
           GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
           FIREBASE_URL: ${{ secrets.FIREBASE_URL }}
           FIREBASE_SECRET: ${{ secrets.FIREBASE_SECRET }}
+          # ДОБАВЛЕНО: Передаем токен внутрь скрипта
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python radar.py
