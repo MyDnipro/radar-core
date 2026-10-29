@@ -1106,6 +1106,31 @@ def sync_cycle():
 
             save_point_to_firebase(sub_post_id, msg, parsed_result, is_clean, post_time_ms)
 
+def trigger_self_restart():
+    """Сам нажимает кнопку перезапуска на GitHub перед выключением."""
+    token = os.environ.get("GITHUB_TOKEN")
+    repo = os.environ.get("GITHUB_REPOSITORY", "MyDnipro/radar-core")
+    
+    if not token:
+        log("⚠️ Токен GITHUB_TOKEN не знайдено, самоперезапуск скасовано.")
+        return
+
+    url = f"https://api.github.com/repos/{repo}/actions/workflows/radar.yml/dispatches"
+    headers = {
+        "Accept": "application/vnd.github.v3+json",
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    
+    try:
+        r = requests.post(url, headers=headers, json={"ref": "main"}, timeout=10)
+        if r.status_code == 204:
+            log("✅ Естафету передано: скрипт успішно перезапустив сам себе!")
+        else:
+            log(f"❌ Помилка самоперезапуску (HTTP {r.status_code}): {r.text}")
+    except Exception as e:
+        log(f"⚠️ Помилка мережі при спробі перезапуску: {e}")
+
 if __name__ == "__main__":
     log(f"🚀 Запуск оновленого радара 24/7 v5.6 (Завантажено {len(GEMINI_KEYS)} API ключів)...")
     start_time = time.time()
@@ -1124,3 +1149,7 @@ if __name__ == "__main__":
         except Exception as e:
             log(f"⚠️ Помилка в циклі: {e}")
         time.sleep(20)
+
+    # За секунду до отключения запускаем себя заново
+    log("⏱️ Час роботи вичерпано. Передача естафети...")
+    trigger_self_restart()
