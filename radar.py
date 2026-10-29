@@ -968,11 +968,21 @@ def preload_existing_ids():
     except Exception as e:
         log(f"⚠️ Не вдалося завантажити shallow кеш ID: {e}")
 
+def send_heartbeat():
+    """Відправляє мітку часу, щоб браузер знав, що скрипт працює."""
+    if BASE_FB_URL:
+        try:
+            url = f"{BASE_FB_URL}/config/heartbeat.json"
+            fb_request("PUT", fb_url(url, is_write=True), json={"last_active": int(time.time() * 1000)}, timeout=5)
+        except:
+            pass
+
 def sync_cycle():
     global PROCESSED_POST_IDS
     cleanup_old_points()
     sync_cloud_knowledge_and_spam()
     update_traffic_stats_history()
+    send_heartbeat()
 
     kb_list = get_knowledge_base()
     items = fetch_channel_messages()
