@@ -1,0 +1,46 @@
+name: Radar Channel 2 (Ями)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 */4 * * *'
+
+# Новий запуск чекає, поки попередній відключиться від Telegram
+# (одна сесія читача не може працювати з двох місць одночасно)
+concurrency:
+  group: radar2-runner
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  run-radar2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Клонування репозиторію
+        uses: actions/checkout@v4
+
+      - name: Налаштування Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Встановлення бібліотек
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests telethon
+
+      - name: Запуск читача каналу 2
+        env:
+          GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
+          FIREBASE_URL: ${{ secrets.FIREBASE_URL }}
+          FIREBASE_SECRET: ${{ secrets.FIREBASE_SECRET }}
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION: ${{ secrets.TG_SESSION }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python radar_ch2.py
